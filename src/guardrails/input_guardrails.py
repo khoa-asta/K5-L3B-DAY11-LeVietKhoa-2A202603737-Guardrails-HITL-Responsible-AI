@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,37 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+
+def _normalize_text(text: str, *, invisible_separator: str = "") -> str:
+    """Fold compatibility characters and remove invisible formatting marks."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = "".join(
+        invisible_separator
+        if unicodedata.category(char) == "Cf" or char in {"\u034f", "\ufe0e", "\ufe0f"}
+        else char
+        for char in text
+    )
+    return " ".join(text.split())
+
+
+def _normalize_topic(text: str) -> str:
+    text = unicodedata.normalize("NFD", _normalize_text(text))
+    return "".join(
+        char for char in text if unicodedata.category(char) != "Mn"
+    ).replace("đ", "d")
+
+
+_INJECTION_PATTERNS = (
+    r"\bignore\s+(?:all\s+)?(?:previous|above)\s+instructions?\b",
+    r"\byou\s+are\s+now\b",
+    r"\bsystem\s+prompt\b",
+    r"\breveal\s+your\s+(?:instructions?|prompt)\b",
+    r"\bpretend\s+you\s+are\b",
+    r"\bact\s+as\s+(?:(?:a|an)\s+)?unrestricted\b",
+    r"\b(?:ignore|disregard|override)\s+(?:all\s+)?"
+    r"(?:(?:prior|previous|above|system|safety)\s+)?(?:instructions?|rules)\b",
+)
 
 
 # ============================================================
@@ -51,14 +83,12 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    # Hidden characters can split a word or stand in for a word separator.
+    for normalized in (
+        _normalize_text(user_input),
+        _normalize_text(user_input, invisible_separator=" "),
+    ):
+        if any(re.search(pattern, normalized) for pattern in _INJECTION_PATTERNS):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +114,26 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    normalized = _normalize_topic(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def contains_topic(topics: list[str]) -> bool:
+        for topic in topics:
+            words = _normalize_topic(topic).split()
+            if words:
+                pattern = r"(?<!\w)" + r"\s+".join(map(re.escape, words))
+                # Accept simple English plurals without matching substrings
+                # such as "kill" in "skill" or "atm" in "atmosphere".
+                if len(words) == 1 and words[0].isascii():
+                    pattern += r"s?"
+                pattern += r"(?!\w)"
+                if re.search(pattern, normalized):
+                    return True
+        return False
 
-    pass  # Replace with your implementation
+    # A forbidden topic takes priority even if banking keywords are present.
+    if contains_topic(BLOCKED_TOPICS):
+        return "BLOCK"
+    return "ALLOW" if contains_topic(ALLOWED_TOPICS) else "BLOCK"
 
 
 # ============================================================
@@ -144,14 +186,31 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            message = "Yêu cầu bị chặn vì chứa chỉ dẫn can thiệp vào hệ thống."
+        elif topic_filter(text) == "BLOCK":
+            message = "Tôi chỉ hỗ trợ các chủ đề ngân hàng được phép. Vui lòng đặt câu hỏi phù hợp."
+        else:
+            return None
 
-        pass  # Replace with your implementation
+        self.blocked_count += 1
+        if isinstance(invocation_context, InvocationContext):
+            # OpenAIRunner treats the returned Content as a refusal. ADK only
+            # replaces the user message here, so before_run must also halt it.
+            invocation_context.end_invocation = True
+        return self._block_response(message)
+
+    async def before_run_callback(
+        self, *, invocation_context: InvocationContext
+    ) -> types.Content | None:
+        """Return the refusal directly in ADK without starting the agent."""
+        if (
+            invocation_context.end_invocation
+            and invocation_context.user_content
+            and invocation_context.user_content.role == "model"
+        ):
+            return invocation_context.user_content
+        return None
 
 
 # ============================================================

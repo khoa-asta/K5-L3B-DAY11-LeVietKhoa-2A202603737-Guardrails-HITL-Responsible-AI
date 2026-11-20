@@ -9,6 +9,7 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 from typing import Any, Callable
 
 from core.config import (
@@ -31,6 +32,7 @@ class OpenAIAgent:
 @dataclass
 class _MockInvocationContext:
     user_id: str = "student"
+    request_id: str | None = None
 
 
 @dataclass
@@ -51,13 +53,24 @@ class OpenAIRunner:
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(
+        self, agent: OpenAIAgent, user_message: str, *,
+        user_id: str = "student", request_id: str | None = None,
+        request_state: dict | None = None,
+    ) -> str:
+        # Per-request decisions avoid attributing another concurrent request's
+        # block/redaction to this one by comparing shared plugin counters.
+        state = request_state if request_state is not None else {}
+        state.update(blocked=False, layer=None, redacted=False, judge_checked=False, judge_failed=False)
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
+                state.update(blocked=True, layer="input_hook")
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self._run_input_plugins(
+            user_message, user_id=user_id, request_id=request_id, request_state=state
+        )
         if block_msg is not None:
             return block_msg
 
@@ -75,10 +88,13 @@ class OpenAIRunner:
         for hook in self.output_hooks:
             text = hook(text)
 
-        text = await self._run_output_plugins(text)
+        text = await self._run_output_plugins(text, request_state=state)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(
+        self, user_message: str, *, user_id: str = "student",
+        request_id: str | None = None, request_state: dict | None = None,
+    ) -> str | None:
         if not self.plugins:
             return None
         try:
@@ -90,23 +106,22 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id, request_id=request_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
                 continue
-            try:
-                result = await cb(
-                    invocation_context=ctx, user_message=user_content
-                )
-            except TypeError:
-                result = cb(invocation_context=ctx, user_message=user_content)
+            result = cb(invocation_context=ctx, user_message=user_content)
+            if inspect.isawaitable(result):
+                result = await result
             if result is None:
                 continue
+            if request_state is not None:
+                request_state.update(blocked=True, layer=plugin.name)
             return _content_to_text(result)
         return None
 
-    async def _run_output_plugins(self, text: str) -> str:
+    async def _run_output_plugins(self, text: str, *, request_state: dict | None = None) -> str:
         if not self.plugins or not text:
             return text
         try:
@@ -125,16 +140,16 @@ class OpenAIRunner:
         llm_response.content = content
 
         class _Ctx:
-            pass
+            def __init__(self, guardrail_result):
+                self.guardrail_result = guardrail_result
 
         for plugin in self.plugins:
             cb = getattr(plugin, "after_model_callback", None)
             if cb is None:
                 continue
-            try:
-                out = await cb(callback_context=_Ctx(), llm_response=llm_response)
-            except TypeError:
-                out = cb(callback_context=_Ctx(), llm_response=llm_response)
+            out = cb(callback_context=_Ctx(request_state), llm_response=llm_response)
+            if inspect.isawaitable(out):
+                out = await out
             if out is not None and getattr(out, "content", None) is not None:
                 llm_response = out
         return _content_to_text(llm_response.content) or text

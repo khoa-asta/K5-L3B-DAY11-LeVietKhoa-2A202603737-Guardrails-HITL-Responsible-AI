@@ -398,6 +398,17 @@ Mẫu đầy đủ: `[SUBMISSION.md](SUBMISSION.md)`.
 
 - `framework` (ví dụ `"google-adk"`)
 
+Nếu cần kiểm tra guardrails khi không có mạng/quota, chạy
+`python src/main.py --part 3 --offline`. Chế độ này chạy cùng các plugin và ghi
+đủ ba JSON, nhưng dùng câu trả lời fixture; `execution_mode: "offline"`,
+`provider: "offline"` và `model: "banking-fixture"` phân biệt với kết quả gọi
+Blue thật. Lệnh mặc định `--part 3` vẫn dùng model Blue cố định của lab.
+
+Nhóm spam gửi lặp lại một câu injection qua cùng người dùng: `passed` chỉ đếm
+request qua được **rate limiter**; lớp input vẫn chặn các câu đó. Trường
+`query_results` ghi quyết định từng request. Audit và metrics là các observer
+bao quanh pipeline, nên ghi nhận cả rate limit, input/output và lỗi provider.
+
 
 
 ### Output của Checkpoint 3 (sau khi chạy lệnh)

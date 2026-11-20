@@ -1,5 +1,5 @@
 """
-Assignment 11 — Rate Limiter starter (TODO).
+Assignment 11 — Per-user sliding-window rate limiting.
 
 Sliding-window, per-user rate limiting. Blocks abuse that other
 guardrail layers do not address (flooding / cost attacks).
@@ -7,8 +7,10 @@ guardrail layers do not address (flooding / cost attacks).
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import math
 import time
 
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.plugins import base_plugin
 from google.genai import types
 
@@ -18,6 +20,10 @@ class RateLimitPlugin(base_plugin.BasePlugin):
 
     def __init__(self, max_requests: int = 10, window_seconds: int = 60):
         super().__init__(name="rate_limiter")
+        if isinstance(max_requests, bool) or not isinstance(max_requests, int) or max_requests < 1:
+            raise ValueError("max_requests must be a positive integer")
+        if isinstance(window_seconds, bool) or not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds must be positive and finite")
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.user_windows: dict[str, deque] = defaultdict(deque)
@@ -34,16 +40,29 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         """Return Content to block, or None to allow."""
         self.total_count += 1
         user_id = getattr(invocation_context, "user_id", None) or "anonymous"
-        now = time.time()
+        now = time.monotonic()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+        if len(window) >= self.max_requests:
+            wait = math.ceil(self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            if isinstance(invocation_context, InvocationContext):
+                invocation_context.end_invocation = True
+            return self._block_response(f"Rate limit exceeded. Try again in {wait}s.")
+
+        # No await between checking and reserving a slot: concurrent tasks on
+        # the same event loop cannot both consume the last available slot.
+        window.append(now)
+        return None
+
+    async def before_run_callback(self, *, invocation_context):
+        """ADK replaces input Content; halt the invocation before any model call."""
+        if (
+            invocation_context.end_invocation
+            and invocation_context.user_content
+            and invocation_context.user_content.role == "model"
+        ):
+            return invocation_context.user_content
+        return None

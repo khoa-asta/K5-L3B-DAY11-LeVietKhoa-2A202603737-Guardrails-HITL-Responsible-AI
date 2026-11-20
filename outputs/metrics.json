@@ -1,0 +1,24 @@
+{
+  "total_requests": 40,
+  "blocked_requests": 32,
+  "block_rate": 0.8,
+  "rate_limit_hits": 6,
+  "judge_checks": 0,
+  "judge_fails": 0,
+  "judge_fail_rate": 0.0,
+  "redacted_responses": 0,
+  "alerts": [
+    {
+      "metric": "block_rate",
+      "value": 0.5454545454545454,
+      "threshold": 0.5,
+      "message": "block_rate exceeded 0.5: 0.545"
+    },
+    {
+      "metric": "rate_limit_hits",
+      "value": 6,
+      "threshold": 5,
+      "message": "rate_limit_hits exceeded 5: 6.000"
+    }
+  ]
+}

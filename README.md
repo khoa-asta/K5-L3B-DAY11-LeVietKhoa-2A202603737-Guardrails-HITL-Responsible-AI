@@ -1,5 +1,15 @@
 # Day 11 — Controlled Agent Security (2026)
 
+- **Họ tên:** Lê Viết Khoa
+- **MSSV:** 2A202603737
+- **Lớp:** K5-L3B
+- **Cách chạy nhanh (từ gốc repo):**
+  - Kích hoạt môi trường Python 3.12 (`.venv312\Scripts\Activate.ps1`)
+  - Checkpoint 2: `python src/main.py --part 2`
+  - Checkpoint 3: `python src/main.py --part 3` (hoặc `python src/main.py --part 3 --offline` khi OpenRouter `:free` bị rate-limit/timeout)
+  - Checkpoint 4: `python src/main.py --part 4`
+  - Checkpoint 5 (kiểm tra & sinh report): `pytest tests/smoke -q`, `pytest tests/public -q`, `python scripts/grade.py --submission-dir . --out outputs/grade_report.json`
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).

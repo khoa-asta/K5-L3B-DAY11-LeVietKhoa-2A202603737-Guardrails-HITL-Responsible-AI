@@ -13,6 +13,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -37,23 +38,52 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    spans = []
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone": r"(?<!\w)(?:0(?:[ .-]?\d){9,10}|\+84(?:[ .-]?\d){9,10})(?!\w)",
+        "email": r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}(?![\w-])",
+        "national_id": r"\b(?:\d{12}|\d{9})\b",
+        "api_key": r"\bsk-[a-zA-Z0-9_-]+\b",
+        "password": (
+            r"\b(?:password|passwd|pwd|mật\s+khẩu)\b[\"']?\s*"
+            r"(?::|=|\bis\b|\blà\b)\s*"
+            r"(?P<value>\"[^\"\r\n]+\"|'[^'\r\n]+'|[^\s,;]+?)"
+            r"(?=[.,!?;:]?(?:\s|$))"
+        ),
+        "api_key_assignment": (
+            r"\bapi[ _-]?key\b[\"']?\s*(?::|=|\bis\b)\s*"
+            r"(?P<value>\"[^\"\r\n]+\"|'[^'\r\n]+'|[^\s,;]+?)"
+            r"(?=[.,!?;:]?(?:\s|$))"
+        ),
     }
+    # Also protect bare demo values (including internal database hosts), even
+    # when the model omits a label such as "password=".
+    known_secrets = sorted((secret for secret in DEMO_SECRETS if secret), key=len, reverse=True)
+    if known_secrets:
+        PII_PATTERNS["known_secret"] = "|".join(map(re.escape, known_secrets))
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = list(re.finditer(pattern, response, re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            spans.extend(
+                match.span("value") if "value" in match.re.groupindex else match.span()
+                for match in matches
+            )
+
+    # Merge overlapping matches before replacing them so that a phone, ID or
+    # known secret inside another secret cannot leave a partially exposed value.
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    redacted = response
+    for start, end in reversed(merged):
+        redacted = redacted[:start] + "[REDACTED]" + redacted[end:]
 
     return {
         "safe": len(issues) == 0,
@@ -154,7 +184,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -167,21 +197,42 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        decision = getattr(callback_context, "guardrail_result", None)
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            if decision is not None:
+                decision.update(redacted=True, layer=self.name)
+            # Scan joined text to catch secrets split across text parts; keep
+            # non-text parts such as tool calls intact.
+            replacement = filtered["redacted"]
+            for part in llm_response.content.parts:
+                if part.text:
+                    part.text = replacement
+                    replacement = ""
+            response_text = filtered["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if decision is not None:
+                decision.update(judge_checked=True, judge_failed=not verdict["safe"])
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                if decision is not None:
+                    decision.update(blocked=True, layer=self.name)
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Xin lỗi, tôi không thể cung cấp câu trả lời này. Vui lòng hỏi về dịch vụ ngân hàng."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
